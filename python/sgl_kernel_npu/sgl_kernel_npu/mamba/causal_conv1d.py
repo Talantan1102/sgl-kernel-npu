@@ -12,7 +12,16 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.dp_attention import get_attention_cp_group
+
 PAD_SLOT_ID = -1
+
+
+def _extract_last_width(x, query_start_loc, state_len):
+    end_loc = query_start_loc[1:]
+    offsets = torch.arange(state_len, device=x.device)
+    indices = end_loc.unsqueeze(1) - state_len + offsets.unsqueeze(0)
+    return x[:, indices].permute(1, 0, 2).contiguous()
 
 
 def causal_conv1d_fn_native(
@@ -150,6 +159,24 @@ def causal_conv1d_fn_npu(
 
     assert query_start_loc[-1] <= x.shape[-1], f"{query_start_loc=}, {x.shape=}"
 
+    # CP: seed init state from previous rank's tail
+    cp_group = get_attention_cp_group()
+    all_tails = None
+    if cp_group.world_size > 1:
+        state_len = weight.shape[1] - 1
+        local_tail = _extract_last_width(x, query_start_loc, state_len)
+        all_tails = cp_group.all_gather(local_tail.unsqueeze(0), dim=0)
+        rank = cp_group.rank_in_group
+        if rank > 0:
+            conv_states[cache_indices] = all_tails[rank - 1]
+        if has_initial_state is None:
+            has_initial_state = torch.ones(
+                cache_indices.shape[0], dtype=torch.bool, device=x.device
+            )
+        else:
+            has_initial_state = has_initial_state.clone()
+            has_initial_state[:] = True
+
     x_pad, initial_state_pad, seqlens, indices = prepare_data(
         x, weight, query_start_loc, cache_indices, has_initial_state, conv_states
     )
@@ -165,6 +192,10 @@ def causal_conv1d_fn_npu(
         return_final_states=True,
     )
     conv_states.index_copy_(0, cache_indices, final_states_out)
+
+    # CP: overwrite cache with last rank's tail so decode sees global tail
+    if all_tails is not None:
+        conv_states[cache_indices] = all_tails[-1]
 
     if x.ndim == 3:
         return out  # [batch_size, dim, seq_len]
