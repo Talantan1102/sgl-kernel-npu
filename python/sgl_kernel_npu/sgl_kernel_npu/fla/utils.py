@@ -162,6 +162,26 @@ def prepare_chunk_offsets(
 
 
 @tensor_cache
+def prepare_final_chunk_indices(
+    cu_seqlens: torch.LongTensor, chunk_size: int
+) -> torch.LongTensor:
+    indices = triton.cdiv(prepare_lens(cu_seqlens), chunk_size) + 1
+    return torch.cumsum(indices, 0) - 1
+
+
+@tensor_cache
+def prepare_update_chunk_offsets(
+    cu_seqlens: torch.LongTensor, chunk_size: int
+) -> torch.LongTensor:
+    return torch.cat(
+        [
+            cu_seqlens.new_tensor([0]),
+            triton.cdiv(prepare_lens(cu_seqlens), chunk_size) + 1,
+        ]
+    ).cumsum(-1)
+
+
+@tensor_cache
 def prepare_position_ids(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return torch.cat(
         [

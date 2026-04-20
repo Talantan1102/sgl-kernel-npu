@@ -7,17 +7,25 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from sglang.srt.layers.dp_attention import get_attention_cp_group
+
 from sgl_kernel_npu.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_npu as chunk_gated_delta_rule_fwd_h,
 )
+from sgl_kernel_npu.fla.chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from sgl_kernel_npu.fla.chunk_o import chunk_fwd_o_npu as chunk_fwd_o
+from sgl_kernel_npu.fla.chunk_o_update import chunk_fwd_o_update
 from sgl_kernel_npu.fla.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd_npu as chunk_scaled_dot_kkt_fwd,
 )
 from sgl_kernel_npu.fla.cumsum import chunk_local_cumsum
 from sgl_kernel_npu.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu as solve_tril
-from sgl_kernel_npu.fla.utils import SUPPRESS_LEVEL, input_guard
+from sgl_kernel_npu.fla.utils import (
+    SUPPRESS_LEVEL,
+    input_guard,
+    prepare_final_chunk_indices,
+)
 from sgl_kernel_npu.fla.wy_fast import recompute_w_u_fwd_npu as recompute_w_u_fwd
 
 
@@ -230,6 +238,39 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
+
+    # CP: stitch per-rank h states across ranks via prefix-scan, then patch
+    # local h with the previous rank's accumulated state. See vllm-ascend PR #6091.
+    cp_group = get_attention_cp_group()
+    if cp_group.world_size > 1:
+        h_update = chunk_gated_delta_rule_fwd_hupdate(
+            k=k, w=w, u=u, g=g, cu_seqlens=cu_seqlens,
+        )
+        final_chunk_indices = prepare_final_chunk_indices(cu_seqlens, 64)
+        final_h_update = h_update[:, final_chunk_indices, :, :, :]
+
+        all_final_state = cp_group.all_gather(final_state.unsqueeze(0), 0)
+        all_final_h_update = cp_group.all_gather(final_h_update, 0)
+
+        updated_state = final_state.new_empty(
+            cp_group.world_size, *final_state.shape
+        )
+        updated_state[0] = all_final_state[0]
+        for i in range(1, cp_group.world_size):
+            updated_state[i] = all_final_state[i] + torch.matmul(
+                all_final_h_update[i], updated_state[i - 1]
+            )
+
+        final_state = updated_state[-1]
+        rank = cp_group.rank_in_group
+        updated_h_state = (
+            torch.zeros_like(final_state) if rank == 0 else updated_state[rank - 1]
+        )
+        h = chunk_fwd_o_update(
+            q=q, v=v_new, h=h, h_update=h_update,
+            updated_h_state=updated_h_state, cu_seqlens=cu_seqlens,
+        )
+
     o = chunk_fwd_o(
         q=q,
         k=k,
