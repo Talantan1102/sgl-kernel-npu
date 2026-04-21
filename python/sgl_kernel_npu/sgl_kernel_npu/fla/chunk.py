@@ -7,8 +7,6 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from sglang.srt.layers.dp_attention import get_attention_cp_group
-
 from sgl_kernel_npu.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_npu as chunk_gated_delta_rule_fwd_h,
 )
@@ -214,6 +212,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    cp_group=None,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
@@ -241,8 +240,7 @@ def chunk_gated_delta_rule_fwd(
 
     # CP: stitch per-rank h states across ranks via prefix-scan, then patch
     # local h with the previous rank's accumulated state. See vllm-ascend PR #6091.
-    cp_group = get_attention_cp_group()
-    if cp_group.world_size > 1:
+    if cp_group is not None and cp_group.world_size > 1:
         h_update = chunk_gated_delta_rule_fwd_hupdate(
             k=k, w=w, u=u, g=g, cu_seqlens=cu_seqlens,
         )
@@ -300,6 +298,7 @@ def chunk_gated_delta_rule_npu(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    cp_group=None,
 ):
     r"""
     Args:
@@ -407,7 +406,8 @@ def chunk_gated_delta_rule_npu(
         k = l2norm_fwd(k)
 
     _, o, _, final_state, _, h, _ = chunk_gated_delta_rule_fwd(
-        q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens
+        q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens,
+        cp_group=cp_group,
     )
     o = o.to(q.dtype)
     if head_first:

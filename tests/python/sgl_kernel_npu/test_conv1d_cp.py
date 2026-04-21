@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """Unit test for context-parallel support in causal_conv1d_fn_npu.
 
-Simulates a 2-rank CP group in a single process by monkey-patching
-get_attention_cp_group, and verifies that splitting a sequence across ranks
-+ CP state stitching reproduces the single-rank result (both output and
-conv_states cache)."""
+Simulates a 2-rank CP group in a single process by passing a FakeCPGroup
+via the ``cp_group`` kwarg, and verifies that splitting a sequence across
+ranks + CP state stitching reproduces the single-rank result (both output
+and conv_states cache)."""
 import pytest
 import torch
 
-from sgl_kernel_npu.mamba import causal_conv1d as conv1d_mod
-from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_npu
+from sgl_kernel_npu.mamba.causal_conv1d import (
+    _extract_last_width,
+    causal_conv1d_fn_npu,
+)
 
 
 class FakeCPGroup:
@@ -59,21 +61,16 @@ def test_conv1d_cp_matches_single_rank(num_seqs, seq_len, dim, width, device):
     )
     has_init_ref = torch.zeros(num_seqs, dtype=torch.bool, device=device)
 
-    original = conv1d_mod.get_attention_cp_group
-    conv1d_mod.get_attention_cp_group = lambda: FakeCPGroup(1, 0, None)
-    try:
-        y_ref = causal_conv1d_fn_npu(
-            x_full,
-            weight,
-            bias,
-            query_start_loc=qsl_full,
-            cache_indices=cache_indices,
-            has_initial_state=has_init_ref,
-            conv_states=conv_states_ref,
-            activation="silu",
-        )
-    finally:
-        conv1d_mod.get_attention_cp_group = original
+    y_ref = causal_conv1d_fn_npu(
+        x_full,
+        weight,
+        bias,
+        query_start_loc=qsl_full,
+        cache_indices=cache_indices,
+        has_initial_state=has_init_ref,
+        conv_states=conv_states_ref,
+        activation="silu",
+    )
 
     # 2-rank CP simulation: split each sequence contiguously at `half`.
     x_r0 = torch.cat(
@@ -91,9 +88,9 @@ def test_conv1d_cp_matches_single_rank(num_seqs, seq_len, dim, width, device):
     )
 
     # Pre-compute what all_gather would produce on each rank.
-    tail_r0 = conv1d_mod._extract_last_width(x_r0, qsl_half, state_len)
-    tail_r1 = conv1d_mod._extract_last_width(x_r1, qsl_half, state_len)
-    # Shape must match the real cp_group.all_gather: (world, num_seqs, dim, state_len).
+    # Shape: (world, num_seqs, dim, state_len), matching real cp_group.all_gather.
+    tail_r0 = _extract_last_width(x_r0, qsl_half, state_len)
+    tail_r1 = _extract_last_width(x_r1, qsl_half, state_len)
     all_tails = torch.stack([tail_r0, tail_r1], dim=0)
 
     conv_states_r0 = torch.zeros_like(conv_states_ref)
@@ -101,35 +98,28 @@ def test_conv1d_cp_matches_single_rank(num_seqs, seq_len, dim, width, device):
     has_init_r0 = torch.zeros(num_seqs, dtype=torch.bool, device=device)
     has_init_r1 = torch.zeros(num_seqs, dtype=torch.bool, device=device)
 
-    conv1d_mod.get_attention_cp_group = lambda: FakeCPGroup(2, 0, all_tails)
-    try:
-        y_r0 = causal_conv1d_fn_npu(
-            x_r0,
-            weight,
-            bias,
-            query_start_loc=qsl_half,
-            cache_indices=cache_indices,
-            has_initial_state=has_init_r0,
-            conv_states=conv_states_r0,
-            activation="silu",
-        )
-    finally:
-        conv1d_mod.get_attention_cp_group = original
-
-    conv1d_mod.get_attention_cp_group = lambda: FakeCPGroup(2, 1, all_tails)
-    try:
-        y_r1 = causal_conv1d_fn_npu(
-            x_r1,
-            weight,
-            bias,
-            query_start_loc=qsl_half,
-            cache_indices=cache_indices,
-            has_initial_state=has_init_r1,
-            conv_states=conv_states_r1,
-            activation="silu",
-        )
-    finally:
-        conv1d_mod.get_attention_cp_group = original
+    y_r0 = causal_conv1d_fn_npu(
+        x_r0,
+        weight,
+        bias,
+        query_start_loc=qsl_half,
+        cache_indices=cache_indices,
+        has_initial_state=has_init_r0,
+        conv_states=conv_states_r0,
+        activation="silu",
+        cp_group=FakeCPGroup(2, 0, all_tails),
+    )
+    y_r1 = causal_conv1d_fn_npu(
+        x_r1,
+        weight,
+        bias,
+        query_start_loc=qsl_half,
+        cache_indices=cache_indices,
+        has_initial_state=has_init_r1,
+        conv_states=conv_states_r1,
+        activation="silu",
+        cp_group=FakeCPGroup(2, 1, all_tails),
+    )
 
     # Reassemble the per-rank outputs in full-sequence order.
     y_cp = torch.cat(
@@ -152,7 +142,7 @@ def test_conv1d_cp_matches_single_rank(num_seqs, seq_len, dim, width, device):
 
 @torch.no_grad()
 def test_conv1d_cp_disabled_is_noop(device):
-    """world_size == 1 should leave has_initial_state / conv_states untouched."""
+    """cp_group=None (or world_size == 1) must leave has_initial_state untouched."""
     torch.manual_seed(0)
     dim, width, seq_len = 16, 4, 8
     state_len = width - 1
@@ -164,25 +154,17 @@ def test_conv1d_cp_disabled_is_noop(device):
     conv_states = torch.randn(2, dim, state_len, device=device)
     conv_states_snapshot = conv_states.clone()
 
-    original = conv1d_mod.get_attention_cp_group
-    conv1d_mod.get_attention_cp_group = lambda: FakeCPGroup(1, 0, None)
-    try:
-        causal_conv1d_fn_npu(
-            x,
-            weight,
-            bias=None,
-            query_start_loc=qsl,
-            cache_indices=cache_indices,
-            has_initial_state=has_init,
-            conv_states=conv_states,
-            activation="silu",
-        )
-    finally:
-        conv1d_mod.get_attention_cp_group = original
+    causal_conv1d_fn_npu(
+        x,
+        weight,
+        bias=None,
+        query_start_loc=qsl,
+        cache_indices=cache_indices,
+        has_initial_state=has_init,
+        conv_states=conv_states,
+        activation="silu",
+        # cp_group omitted -> CP branch must short-circuit
+    )
 
-    # With has_initial_state=False and world_size=1, the kernel still writes
-    # the final tail into conv_states (that's the normal non-CP behavior).
-    # The point of this test is that the CP branch must not fire and flip
-    # has_initial_state under the hood. has_init should remain untouched.
     assert has_init.tolist() == [False]
-    assert not torch.equal(conv_states, conv_states_snapshot)  # kernel did write
+    assert not torch.equal(conv_states, conv_states_snapshot)  # kernel did write tail

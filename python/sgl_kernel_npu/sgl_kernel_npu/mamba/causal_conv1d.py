@@ -12,8 +12,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.dp_attention import get_attention_cp_group
-
 PAD_SLOT_ID = -1
 
 
@@ -160,9 +158,9 @@ def causal_conv1d_fn_npu(
     assert query_start_loc[-1] <= x.shape[-1], f"{query_start_loc=}, {x.shape=}"
 
     # CP: seed init state from previous rank's tail
-    cp_group = get_attention_cp_group()
+    cp_group = kwargs.pop("cp_group", None)
     all_tails = None
-    if cp_group.world_size > 1:
+    if cp_group is not None and cp_group.world_size > 1:
         state_len = weight.shape[1] - 1
         local_tail = _extract_last_width(x, query_start_loc, state_len)
         all_tails = cp_group.all_gather(local_tail.unsqueeze(0), dim=0)
